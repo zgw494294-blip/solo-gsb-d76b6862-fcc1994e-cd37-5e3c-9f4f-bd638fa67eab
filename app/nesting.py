@@ -10,6 +10,11 @@
 区间关系全部合法时，按 (start, -end, label, str(id)) 排序，用栈确定最窄直接
 父级；根 label 须在 root_labels 中，非根 label 须在直接父级的 children 中。
 存在任何错误时禁止导出；导出为保留原 id、label、范围的稳定嵌套 JSON。
+
+建树、规则校验与视图/导出均为显式栈的迭代实现：合法批注可形成远超 Python
+默认递归上限（1000）的深链（如数千条严格包含的批注），递归实现会抛
+RecursionError；迭代实现的栈深随层数线性增长，且不提高全局递归上限、
+不限制深度，输出仍是完整的原嵌套树（不是扁平结构）。
 """
 
 from __future__ import annotations
@@ -114,12 +119,21 @@ def build_tree(annotations: list[dict]) -> list[dict]:
 
 
 def check_labels(roots: list[dict], rules: dict) -> list[dict]:
-    """检查 label 规则：根 label 须在 root_labels，子 label 须在直接父级的 children 中。"""
+    """检查 label 规则：根 label 须在 root_labels，子 label 须在直接父级的 children 中。
+
+    迭代前序遍历（显式栈，兄弟倒序入栈），错误顺序与递归前序遍历逐字一致，
+    深链不会触发 RecursionError。
+    """
     errors = []
     root_labels = set(rules["root_labels"])
     children = rules["children"]
 
-    def visit(node: dict, parent: dict | None) -> None:
+    # 待访问帧：(节点, 父批注或 None)。根/兄弟均倒序入栈，弹出顺序即前序。
+    pending: list[tuple[dict, dict | None]] = []
+    for r in reversed(roots):
+        pending.append((r, None))
+    while pending:
+        node, parent = pending.pop()
         a = node["annotation"]
         if parent is None:
             if a["label"] not in root_labels:
@@ -136,29 +150,47 @@ def check_labels(roots: list[dict], rules: dict) -> list[dict]:
                 "message": f"批注 {a['id']} 的 label「{a['label']}」不在直接父级 "
                            f"{parent['id']}（label「{parent['label']}」）的 children 中",
             })
-        for c in node["children"]:
-            visit(c, a)
-
-    for r in roots:
-        visit(r, None)
+        for c in reversed(node["children"]):
+            pending.append((c, a))
     return errors
 
 
-def _view(text: str, node: dict) -> dict:
-    """附带原文片段的节点视图（供页面展示）。"""
-    a = node["annotation"]
-    return {"id": a["id"], "label": a["label"],
-            "start": a["start"], "end": a["end"],
-            "text": text[a["start"]:a["end"]],
-            "children": [_view(text, c) for c in node["children"]]}
+def _view_nodes(text: str, roots: list[dict]) -> list[dict]:
+    """迭代构造附带原文片段的视图树（供页面展示）。
+
+    显式栈弹出待加工节点并就地挂上已构造的子视图；兄弟倒序入栈，各层
+    children 顺序与递归实现一致。深链只增加栈长度，不增加调用深度。
+    """
+    view_roots: list[dict] = []
+    # 待加工帧：(内部节点, 处理完挂回的目标列表)
+    todo: list[tuple[dict, list]] = [(n, view_roots) for n in reversed(roots)]
+    while todo:
+        node, target = todo.pop()
+        a = node["annotation"]
+        view = {"id": a["id"], "label": a["label"],
+                "start": a["start"], "end": a["end"],
+                "text": text[a["start"]:a["end"]],
+                "children": []}
+        target.append(view)
+        for c in reversed(node["children"]):
+            todo.append((c, view["children"]))
+    return view_roots
 
 
-def _export(node: dict) -> dict:
-    """导出节点：保留原 id、label、范围。"""
-    a = node["annotation"]
-    return {"id": a["id"], "label": a["label"],
-            "start": a["start"], "end": a["end"],
-            "children": [_export(c) for c in node["children"]]}
+def _export_nodes(roots: list[dict]) -> list[dict]:
+    """迭代导出：保留原 id、label、范围（结构与 _view_nodes 相同，不带原文）。"""
+    out_roots: list[dict] = []
+    todo: list[tuple[dict, list]] = [(n, out_roots) for n in reversed(roots)]
+    while todo:
+        node, target = todo.pop()
+        a = node["annotation"]
+        out = {"id": a["id"], "label": a["label"],
+               "start": a["start"], "end": a["end"],
+               "children": []}
+        target.append(out)
+        for c in reversed(node["children"]):
+            todo.append((c, out["children"]))
+    return out_roots
 
 
 def audit_nesting(text: str, annotations: list[dict], rules: dict) -> dict:
@@ -172,9 +204,9 @@ def audit_nesting(text: str, annotations: list[dict], rules: dict) -> dict:
         return {"errors": span_errors, "tree": None}
     roots = build_tree(annotations)
     return {"errors": check_labels(roots, rules),
-            "tree": [_view(text, r) for r in roots]}
+            "tree": _view_nodes(text, roots)}
 
 
 def export_nesting(annotations: list[dict]) -> list[dict]:
     """导出稳定嵌套 JSON（假定审计无错误）：保留原 id、label、范围。"""
-    return [_export(n) for n in build_tree(annotations)]
+    return _export_nodes(build_tree(annotations))

@@ -12,6 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.convertors import Convertor, register_url_convertor
 
+from app.iterjson import DeepJSONResponse
+
 from app.arbitration import ArbitrationError, apply_arbitration, build_groups
 from app.copies import (
     AnnotationNotFound,
@@ -346,14 +348,16 @@ def sequence_export(req: SequenceRequest):
 
 
 @app.post("/api/nesting/preview")
-def nesting_preview(req: NestingRequest):
+def nesting_preview(req: NestingRequest) -> DeepJSONResponse:
     (anns,) = validate(req, LABELED)
     rules = _validate_rules(req.rules)
-    return audit_nesting(req.text, anns, rules)
+    # 深树（远超默认递归上限）下默认 json 编码器会 RecursionError → 500，
+    # 用无递归 DeepJSONResponse 渲染完整嵌套 JSON
+    return DeepJSONResponse(audit_nesting(req.text, anns, rules))
 
 
 @app.post("/api/nesting/export")
-def nesting_export(req: NestingRequest):
+def nesting_export(req: NestingRequest) -> DeepJSONResponse:
     (anns,) = validate(req, LABELED)
     rules = _validate_rules(req.rules)
     result = audit_nesting(req.text, anns, rules)  # 后端重新计算审计结果
@@ -362,7 +366,7 @@ def nesting_export(req: NestingRequest):
             "message": "存在嵌套审计错误，禁止导出",
             "errors": result["errors"],
         })
-    return {"tree": export_nesting(anns), "count": len(anns)}
+    return DeepJSONResponse({"tree": export_nesting(anns), "count": len(anns)})
 
 
 @app.post("/api/units/preview")

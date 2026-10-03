@@ -59,7 +59,11 @@
 - 页面展示全部错误与合法嵌套树；**存在错误时禁止导出**；导出时后端**重新计算**，
   返回保留原 `id`、`label`、`start`、`end` 的**稳定嵌套 JSON**（各层 children 按上述排序键稳定有序）；
 - 非法区间、空 `label`、重复 `id` 均返回 **422**；`root_labels` 或任一 `children`
-  列表含重复 label 同样返回 **422**。
+  列表含重复 label 同样返回 **422**；
+- **深树不递归崩溃**：建树、label 规则检查、树视图、导出与 HTTP 响应编码全部为
+  显式栈的迭代实现，数千条严格包含批注（嵌套深度远超 Python 默认递归上限 1000）
+  也在**默认递归上限**下返回完整的原嵌套 JSON——不提高全局递归上限、不限制深度、
+  不改为扁平结构；字段、父子排序、错误列表、**422** / 有错误导出 **409** 均不变。
 
 ## 批注偏移制式转换（/units）
 
@@ -655,6 +659,50 @@ ABC 4 7 O B-短语
 若两条批注部分交叉（如 `[0, 5)` 与 `[3, 7)`）则记 `crossing` 错误；范围完全相同
 则记 `duplicate_span` 错误；存在任何错误时禁止导出（导出接口返回 **409**）。
 
+## 嵌套审计深树示例（超递归上限）
+
+合法批注可形成极深的嵌套链。以下输入为 2400 个 `x` 的文本、1200 条严格包含的
+批注（`id=str(i)`、`[i, 2400-i)`、label 均为 `L`），深度 1200 超过 Python 默认
+递归上限 1000；预览与导出仍在默认上限下返回**完整的原嵌套 JSON**（核心建树、规则
+检查、视图、导出与响应编码均为显式栈迭代实现，不提高递归上限、不限制深度、不扁平化）：
+
+```bash
+# text 为 2400 个 x（此处用 $(python3 -c 'print("x"*2400, end="")') 生成）；
+# 1200 条批注为 [0,2400) [1,2399) … [1199,1201) 的严格包含链
+python3 - <<'PY' | curl -s http://localhost:8000/api/nesting/export \
+  -H 'Content-Type: application/json' --data-binary @-
+import json
+print(json.dumps({
+    "text": "x" * 2400,
+    "annotations": [
+        {"id": str(i), "start": i, "end": 2400 - i, "label": "L"}
+        for i in range(1200)
+    ],
+    "rules": {"root_labels": ["L"], "children": {"L": ["L"]}},
+}))
+PY
+```
+
+上例只示意了前两条；完整生成 1200 条 `[i, 2400-i)` 后，`tree` 是一条 1200 层的
+单链，最外层为 `id="0" [0, 2400)`、最内层为 `id="1199" [1199, 1201)`，各节点保留
+原 `id` / `label` / `start` / `end` 且 `children` 按排序键有序；响应形如
+`{"tree":[{"id":"0","label":"L","start":0,"end":2400,"children":[{"id":"1",…}…]}],"count":1200}`。
+预览接口同构，额外返回 `"errors":[]` 与每个节点的原文片段 `text`。深层某条 label
+非法（如第 600 条改为其他 label）时仍按原规则逐条报告 `root_label` / `child_label`，
+且导出仍返回 **409**。Python 直接生成请求体示例：
+
+```python
+text = "x" * 2400
+payload = {
+    "text": text,
+    "annotations": [
+        {"id": str(i), "start": i, "end": 2400 - i, "label": "L"}
+        for i in range(1200)
+    ],
+    "rules": {"root_labels": ["L"], "children": {"L": ["L"]}},
+}
+```
+
 ## 制式转换最小输入示例
 
 打开 **http://localhost:8000/units**，两个输入框分别对应：文本、批注 JSON；
@@ -875,8 +923,8 @@ JSON」得到：
 | POST | `/api/arbitrate/export` | 同上加 `decisions`（`{"组号": "left"｜"right"｜"discard"}`）；后端重新分组并校验决策，仍有未处理组时返回 **409** 并列出 `pending_groups`，决策非法（未知组号 / 未知取值 / 对已自动通过的组做决策）返回 **422** |
 | POST | `/api/sequence/preview` | 入参 `{text, annotations:[{id,start,end,label}]}`，返回 `{layers, tokens:[{text,start,end,tags}]}`（每 token 的各层 BILOU 标签） |
 | POST | `/api/sequence/export` | 同上，返回 `{conll, layers, token_count}`，`conll` 为 UTF-8 CoNLL 文本（每行 `token start end 各层标签`）；非法区间 / 空 label / 重复 id / 批注只覆盖空白均返回 **422** |
-| POST | `/api/nesting/preview` | 入参 `{text, annotations:[{id,start,end,label}], rules:{root_labels:[…], children:{父label:[子label…]}}}`，返回 `{errors, tree}`（`errors` 含 `duplicate_span` / `crossing` / `root_label` / `child_label`）；存在 `duplicate_span` / `crossing` 时 `tree` 为 `null` |
-| POST | `/api/nesting/export` | 同上；后端重新计算审计，存在错误时返回 **409** 并列出 `errors`，否则返回 `{tree, count}`——保留原 id / label / 范围的稳定嵌套 JSON；非法区间 / 空 label / 重复 id / 规则列表含重复 label 均返回 **422** |
+| POST | `/api/nesting/preview` | 入参 `{text, annotations:[{id,start,end,label}], rules:{root_labels:[…], children:{父label:[子label…]}}}`，返回 `{errors, tree}`（`errors` 含 `duplicate_span` / `crossing` / `root_label` / `child_label`）；存在 `duplicate_span` / `crossing` 时 `tree` 为 `null`；建树、规则检查、视图与响应编码均为无递归迭代实现，深度超过默认递归上限的合法深树也返回完整嵌套 JSON（不提高上限、不限制深度、不扁平化） |
+| POST | `/api/nesting/export` | 同上；后端重新计算审计，存在错误时返回 **409** 并列出 `errors`，否则返回 `{tree, count}`——保留原 id / label / 范围的稳定嵌套 JSON（深树同样完整返回）；非法区间 / 空 label / 重复 id / 规则列表含重复 label 均返回 **422** |
 | POST | `/api/units/preview` | 入参 `{text, annotations:[{id,start,end,…}], source_unit, target_unit}`（制式取 `codepoint` / `utf16` / `utf8_byte`），返回 `{items:[{id,text,coordinates:{codepoint,utf16,utf8_byte},errors}], errors, lengths}`——每条批注原文与三种制式坐标；非法批注 `text`、`coordinates` 为 `null`，错误逐项列出（`out_of_range` / `not_boundary` / `bad_interval`，含 id、字段、值）；重复 id 返回 **422** |
 | POST | `/api/units/export` | 同上；后端重新遍历文本、重建边界映射并重算，存在非法批注时返回 **409** 并列出 `errors`，否则返回 `{annotations, source_unit, target_unit, count}`——仅 `start`、`end` 转为目标制式，保持输入顺序与其余字段不变 |
 | POST | `/api/review/preview` | 入参 `{text, annotations:[{id,start,end,label}], max_chars, context_chars}`（`id` 为唯一字符串），返回 `{fragments:[{fragment_id,text,start,end,sha256,annotations(局部坐标)}], count}`；单条批注超过 `max_chars`、非法区间 / 空 label / 重复 id / 非法参数均返回 **422** |
@@ -1065,7 +1113,8 @@ app/
   migration.py       # 迁移核心：匹配块平移、原文搜索、上下文 Levenshtein 裁决
   arbitration.py     # 仲裁核心：二分图连通分量分组、整组决策校验与导出
   sequence.py        # 序列标注核心：token 切分、批注边界切开、贪心分层、BILOU 与 CoNLL 生成
-  nesting.py         # 嵌套审计核心：区间关系检查、栈式建树、label 规则校验与稳定嵌套 JSON 导出
+  nesting.py         # 嵌套审计核心：区间关系检查、栈式建树、label 规则校验与稳定嵌套 JSON 导出（树视图/规则检查/导出均显式栈迭代，深树不递归崩溃）
+  iterjson.py        # 无递归 JSON 序列化：显式栈迭代 dumps（与 json.dumps 逐字节一致）与深树响应 DeepJSONResponse
   units.py           # 制式转换核心：一次遍历建立三套字符边界映射、边界校验与偏移换算
   review.py          # 审阅切片核心：顺序装箱、窗口均分与边界余量转移、JSONL 导出、审阅结果校验回导
   relabel.py         # 标签体系迁移核心：规则集校验（目标标签 / 正则 / 回退约束）、迁移链求值（循环与缺规则检测）、导出重算
@@ -1077,6 +1126,8 @@ tests/
   test_arbitration.py
   test_sequence.py
   test_nesting.py
+  test_iterjson.py
+  test_nesting_http.py
   test_units.py
   test_review.py
   test_relabel.py

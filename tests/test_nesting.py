@@ -278,3 +278,121 @@ def test_validate_rules_defaults_and_normalizes():
     assert validate_rules({}) == {"root_labels": [], "children": {}}
     rules = validate_rules({"root_labels": ("文档",), "children": {"文档": ("章节",)}})
     assert rules == {"root_labels": ["文档"], "children": {"文档": ["章节"]}}
+
+
+# ---------- 深树（超过默认递归上限）：迭代实现回归 ----------
+
+def deep_annotations(n=1200, text_len=None):
+    """n 条严格包含的批注：id=str(i)、[i, text_len-i)、label L，形成深度 n 的链。"""
+    text_len = text_len or 2 * n
+    return [ann(str(i), i, text_len - i, "L") for i in range(n)]
+
+
+def assert_chain(node, n, text_len, *, has_text, text=""):
+    """迭代沿唯一子链向下断言：字段为原值、各层单传、深度恰为 n（无递归）。"""
+    for i in range(n):
+        assert node["id"] == str(i)
+        assert node["label"] == "L"
+        assert node["start"] == i
+        assert node["end"] == text_len - i
+        if has_text:
+            assert node["text"] == text[i:text_len - i]
+        kids = node["children"]
+        if i == n - 1:
+            assert kids == []
+        else:
+            assert len(kids) == 1
+            node = kids[0]
+
+
+def test_deep_chain_audit_with_default_recursion_limit():
+    # 1200 层严格包含链（> 默认 1000 递归上限）：规则检查与树视图均不得递归崩溃
+    text = "x" * 2400
+    anns = deep_annotations()
+    rules = validate_rules({"root_labels": ["L"], "children": {"L": ["L"]}})
+    res = audit_nesting(text, anns, rules)
+    assert res["errors"] == []
+    (root,) = res["tree"]
+    assert_chain(root, 1200, 2400, has_text=True, text=text)
+
+
+def test_deep_chain_export_with_default_recursion_limit():
+    anns = deep_annotations()
+    out = export_nesting(anns)
+    (root,) = out
+    assert_chain(root, 1200, 2400, has_text=False)
+    # 导出不带原文片段（与浅树一致）
+    assert "text" not in root
+
+
+def test_deep_chain_check_labels_reports_illegal_deep_label():
+    # 深层非法 label 仍按原规则报告：600 自身非法、其子 601 也因父 label 非法而非法
+    anns = deep_annotations()
+    anns[600] = ann("600", 600, 2400 - 600, "X")
+    rules = validate_rules({"root_labels": ["L"], "children": {"L": ["L"]}})
+    roots = build_tree(anns)
+    errors = check_labels(roots, rules)
+    assert [(e["type"], e["ids"]) for e in errors] == [
+        (CHILD_LABEL, ["599", "600"]),
+        (CHILD_LABEL, ["600", "601"]),
+    ]
+
+
+def test_deep_chain_illegal_root_label_reported():
+    anns = deep_annotations()
+    anns[0] = ann("0", 0, 2400, "X")
+    rules = validate_rules({"root_labels": ["L"], "children": {"L": ["L"]}})
+    errors = check_labels(build_tree(anns), rules)
+    assert errors[0] == {
+        "type": ROOT_LABEL, "ids": ["0"],
+        "message": "根批注 0 的 label「X」不在 root_labels 中",
+    }
+
+
+def test_deep_chain_errors_deterministic_order():
+    # 倒序输入不影响结果顺序（排序键稳定）。注意：深 dict 的 == 本身是递归实现
+    # （比较也会 RecursionError），用迭代序列化结果做结构等价判断。
+    from app.iterjson import dumps
+
+    anns = deep_annotations()
+    fwd = dumps(export_nesting(anns))
+    rev = dumps(export_nesting(list(reversed(anns))))
+    assert fwd == rev
+
+
+def test_shallow_tree_still_identical():
+    # 浅树行为与字段形态保持不变（迭代改写回归）
+    text = "目标：统一口径。"
+    anns = [ann("p", 0, 8, "段落"), ann("s", 3, 7, "短语")]
+    rules = validate_rules({"root_labels": ["段落"], "children": {"段落": ["短语"]}})
+    res = audit_nesting(text, anns, rules)
+    assert res == {
+        "errors": [],
+        "tree": [
+            {"id": "p", "label": "段落", "start": 0, "end": 8, "text": text,
+             "children": [
+                 {"id": "s", "label": "短语", "start": 3, "end": 7,
+                  "text": "统一口径", "children": []},
+             ]},
+        ],
+    }
+    assert export_nesting(anns) == [
+        {"id": "p", "label": "段落", "start": 0, "end": 8,
+         "children": [
+             {"id": "s", "label": "短语", "start": 3, "end": 7, "children": []},
+         ]},
+    ]
+
+
+def test_shallow_multi_root_and_siblings_unchanged():
+    # 多根、多兄弟、相接区间：视图与导出的父子/兄弟排序不变
+    anns = [ann("a", 0, 4, "x"), ann("b", 4, 8, "x"), ann("c", 5, 7, "x")]
+    assert shape(build_tree(anns)) == [("a", []), ("b", [("c", [])])]
+    text = "abcdefgh"
+    res = audit_nesting(text, anns, validate_rules({"root_labels": ["x"], "children": {"x": ["x"]}}))
+    assert view_shape(res["tree"]) == [("a", []), ("b", [("c", [])])]
+    assert export_nesting(anns) == [
+        {"id": "a", "label": "x", "start": 0, "end": 4, "children": []},
+        {"id": "b", "label": "x", "start": 4, "end": 8,
+         "children": [{"id": "c", "label": "x", "start": 5, "end": 7, "children": []}]},
+    ]
