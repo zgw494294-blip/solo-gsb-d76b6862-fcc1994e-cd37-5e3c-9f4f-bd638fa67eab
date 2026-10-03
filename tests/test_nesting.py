@@ -1,5 +1,8 @@
 """嵌套批注审计核心逻辑测试（纯标准库，无需启动服务）。"""
 
+import json
+import sys
+
 import pytest
 
 from app.nesting import (
@@ -11,6 +14,7 @@ from app.nesting import (
     audit_nesting,
     build_tree,
     check_labels,
+    dumps_deep,
     export_nesting,
     find_span_errors,
     validate_rules,
@@ -278,3 +282,100 @@ def test_validate_rules_defaults_and_normalizes():
     assert validate_rules({}) == {"root_labels": [], "children": {}}
     rules = validate_rules({"root_labels": ("文档",), "children": {"文档": ("章节",)}})
     assert rules == {"root_labels": ["文档"], "children": {"文档": ["章节"]}}
+
+
+# ---------- 深树回归（默认递归上限下不崩溃） ----------
+
+def deep_chain(depth):
+    """深树场景：text 为 2*depth 个 "x"，批注 i 覆盖 [i, 2*depth-i)，label 全为 "L"。"""
+    text = "x" * (2 * depth)
+    anns = [ann(str(i), i, 2 * depth - i, "L") for i in range(depth)]
+    rules = validate_rules({"root_labels": ["L"], "children": {"L": ["L"]}})
+    return text, anns, rules
+
+
+def walk_chain(node):
+    """沿单链树逐层产出节点（迭代，避免测试自身递归）。"""
+    while True:
+        yield node
+        assert len(node["children"]) <= 1
+        if not node["children"]:
+            return
+        node = node["children"][0]
+
+
+def test_deep_chain_audit_and_export_under_default_recursion_limit():
+    # 2400 个 "x" + 1200 层严格嵌套：预览与导出均不得 RecursionError
+    limit = sys.getrecursionlimit()
+    text, anns, rules = deep_chain(1200)
+
+    res = audit_nesting(text, anns, rules)
+    assert res["errors"] == []
+    (root_view,) = res["tree"]
+    for i, node in enumerate(walk_chain(root_view)):
+        assert (node["id"], node["label"], node["start"], node["end"]) == \
+            (str(i), "L", i, 2400 - i)
+        assert node["text"] == "x" * (2400 - 2 * i)
+    assert i == 1199
+
+    (root_out,) = export_nesting(anns)
+    for i, node in enumerate(walk_chain(root_out)):
+        assert (node["id"], node["label"], node["start"], node["end"]) == \
+            (str(i), "L", i, 2400 - i)
+        assert set(node) == {"id", "label", "start", "end", "children"}
+    assert i == 1199
+    assert sys.getrecursionlimit() == limit  # 未提高全局递归上限
+
+
+def test_deep_chain_illegal_label_still_reported():
+    # 深层非法 label 仍按原规则报告（child_label，ids 为 [父, 子]），树仍建成
+    text, anns, rules = deep_chain(1200)
+    anns[1199]["label"] = "BAD"
+    res = audit_nesting(text, anns, rules)
+    assert [e["type"] for e in res["errors"]] == [CHILD_LABEL]
+    assert res["errors"][0]["ids"] == ["1198", "1199"]
+    (root_view,) = res["tree"]
+    assert sum(1 for _ in walk_chain(root_view)) == 1200
+
+
+def test_deep_tree_siblings_keep_sort_order():
+    # 深链底部的并列子级：children 仍按 (start, -end, label, str(id)) 稳定有序
+    text = "x" * 1100
+    anns = [ann(str(i), i, 1100 - i, "L") for i in range(500)]
+    anns += [ann("deep-b", 550, 600, "L"), ann("deep-a", 500, 550, "L")]  # 乱序输入
+    rules = validate_rules({"root_labels": ["L"], "children": {"L": ["L"]}})
+    res = audit_nesting(text, anns, rules)
+    assert res["errors"] == []
+    node = res["tree"][0]
+    for _ in range(499):
+        (node,) = node["children"]
+    assert [c["id"] for c in node["children"]] == ["deep-a", "deep-b"]
+    node = export_nesting(anns)[0]
+    for _ in range(499):
+        (node,) = node["children"]
+    assert [c["id"] for c in node["children"]] == ["deep-a", "deep-b"]
+
+
+# ---------- dumps_deep：迭代 JSON 序列化 ----------
+
+def test_dumps_deep_matches_stdlib_on_shallow_payloads():
+    payload = {
+        "tree": [{"id": "p", "label": "段落", "start": 0, "end": 8,
+                  "children": [{"id": "s", "label": "短语", "start": 3,
+                                "end": 7, "children": []}]}],
+        "count": 2,
+        "errors": [],
+        "misc": [None, True, False, 2.5, -3, "引号\"反斜杠\\换行\n", "中文🎉"],
+        "empty": {},
+    }
+    assert dumps_deep(payload) == \
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def test_dumps_deep_handles_deep_nesting():
+    depth = 1200
+    node = {"children": []}
+    for _ in range(depth - 1):
+        node = {"children": [node]}
+    s = dumps_deep(node)
+    assert s == '{"children":[' * (depth - 1) + '{"children":[]}' + ']}' * (depth - 1)

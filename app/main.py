@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BeforeValidator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,7 +27,13 @@ from app.copies import (
     RevisionNotFound,
 )
 from app.migration import DecisionError, apply_decisions, migrate_annotations
-from app.nesting import NestingError, audit_nesting, export_nesting, validate_rules
+from app.nesting import (
+    NestingError,
+    audit_nesting,
+    dumps_deep,
+    export_nesting,
+    validate_rules,
+)
 from app.redaction import (
     RedactionError,
     redact_export as run_redact_export,
@@ -349,7 +355,7 @@ def sequence_export(req: SequenceRequest):
 def nesting_preview(req: NestingRequest):
     (anns,) = validate(req, LABELED)
     rules = _validate_rules(req.rules)
-    return audit_nesting(req.text, anns, rules)
+    return _nesting_response(audit_nesting(req.text, anns, rules))
 
 
 @app.post("/api/nesting/export")
@@ -362,7 +368,7 @@ def nesting_export(req: NestingRequest):
             "message": "存在嵌套审计错误，禁止导出",
             "errors": result["errors"],
         })
-    return {"tree": export_nesting(anns), "count": len(anns)}
+    return _nesting_response({"tree": export_nesting(anns), "count": len(anns)})
 
 
 @app.post("/api/units/preview")
@@ -600,6 +606,16 @@ def _validate_rules(rules: RulesIn) -> dict:
                                "children": rules.children})
     except NestingError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+def _nesting_response(payload: dict) -> Response:
+    """嵌套审计响应：迭代序列化后直接返回，深嵌套树在默认递归上限下不崩溃。
+
+    FastAPI 默认的 jsonable_encoder 与 json.dumps 都是递归实现，上千层的
+    嵌套树会触发 RecursionError；这里改用 app.nesting.dumps_deep（显式栈，
+    输出格式与 JSONResponse 一致），并直接返回 Response 跳过递归编码。
+    """
+    return Response(content=dumps_deep(payload), media_type="application/json")
 
 
 def _validate_relabel_rules(rules: RelabelRulesIn) -> dict:

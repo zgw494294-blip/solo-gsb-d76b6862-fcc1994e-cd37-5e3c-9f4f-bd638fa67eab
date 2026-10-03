@@ -59,7 +59,34 @@
 - 页面展示全部错误与合法嵌套树；**存在错误时禁止导出**；导出时后端**重新计算**，
   返回保留原 `id`、`label`、`start`、`end` 的**稳定嵌套 JSON**（各层 children 按上述排序键稳定有序）；
 - 非法区间、空 `label`、重复 `id` 均返回 **422**；`root_labels` 或任一 `children`
-  列表含重复 label 同样返回 **422**。
+  列表含重复 label 同样返回 **422**；
+- 规则检查、树视图、导出与响应序列化均为**显式栈迭代实现**：上千层的深嵌套树
+  在默认递归上限下也能完整审计与导出（不提高全局递归上限、不限制深度、不改为扁平结构）。
+
+### 调用示例
+
+```bash
+# 预览审计结果：{"errors": [...], "tree": [...] 或 null}
+curl -s -X POST http://localhost:8000/api/nesting/preview \
+  -H "Content-Type: application/json" \
+  -d '{
+        "text": "abcdef",
+        "annotations": [
+          {"id": "p", "start": 0, "end": 6, "label": "段落"},
+          {"id": "s", "start": 1, "end": 3, "label": "短语"}
+        ],
+        "rules": {"root_labels": ["段落"], "children": {"段落": ["短语"]}}
+      }'
+# → {"errors":[],"tree":[{"id":"p","label":"段落","start":0,"end":6,"text":"abcdef",
+#    "children":[{"id":"s","label":"短语","start":1,"end":3,"text":"bc","children":[]}]}]}
+
+# 导出稳定嵌套 JSON：{"tree": [...], "count": N}；存在审计错误时返回 409
+curl -s -X POST http://localhost:8000/api/nesting/export \
+  -H "Content-Type: application/json" \
+  -d '{ ...同上... }'
+# → {"tree":[{"id":"p","label":"段落","start":0,"end":6,
+#    "children":[{"id":"s","label":"短语","start":1,"end":3,"children":[]}]}],"count":2}
+```
 
 ## 批注偏移制式转换（/units）
 

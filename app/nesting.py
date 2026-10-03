@@ -10,9 +10,15 @@
 区间关系全部合法时，按 (start, -end, label, str(id)) 排序，用栈确定最窄直接
 父级；根 label 须在 root_labels 中，非根 label 须在直接父级的 children 中。
 存在任何错误时禁止导出；导出为保留原 id、label、范围的稳定嵌套 JSON。
+
+规则检查、树视图、导出与响应序列化（dumps_deep）均为显式栈迭代实现：
+上千层的深嵌套树在默认递归上限下也能完整审计与导出，不提高全局递归
+上限、不限制深度、不改为扁平结构。
 """
 
 from __future__ import annotations
+
+import json
 
 # 错误类型
 DUPLICATE_SPAN = "duplicate_span"  # 同范围
@@ -114,12 +120,18 @@ def build_tree(annotations: list[dict]) -> list[dict]:
 
 
 def check_labels(roots: list[dict], rules: dict) -> list[dict]:
-    """检查 label 规则：根 label 须在 root_labels，子 label 须在直接父级的 children 中。"""
+    """检查 label 规则：根 label 须在 root_labels，子 label 须在直接父级的 children 中。
+
+    用显式栈做前序遍历（弹出顺序与递归版完全一致）：嵌套再深也不占用
+    Python 调用栈，默认递归上限下不会 RecursionError。
+    """
     errors = []
     root_labels = set(rules["root_labels"])
     children = rules["children"]
-
-    def visit(node: dict, parent: dict | None) -> None:
+    # 栈元素：(节点, 父级批注)；子节点逆序入栈，弹出时保持原前序
+    stack = [(r, None) for r in reversed(roots)]
+    while stack:
+        node, parent = stack.pop()
         a = node["annotation"]
         if parent is None:
             if a["label"] not in root_labels:
@@ -136,29 +148,43 @@ def check_labels(roots: list[dict], rules: dict) -> list[dict]:
                 "message": f"批注 {a['id']} 的 label「{a['label']}」不在直接父级 "
                            f"{parent['id']}（label「{parent['label']}」）的 children 中",
             })
-        for c in node["children"]:
-            visit(c, a)
-
-    for r in roots:
-        visit(r, None)
+        for c in reversed(node["children"]):
+            stack.append((c, a))
     return errors
+
+
+def _map_tree(node: dict, project) -> dict:
+    """把节点树投影为输出树（显式栈迭代，深树不递归）。
+
+    project(批注) 给出输出节点的字段（不含 children）；各层 children
+    按原顺序挂接，与递归构建的结果完全一致。
+    """
+    root = {**project(node["annotation"]), "children": []}
+    stack = [(node, root)]  # (树节点, 对应输出节点)
+    while stack:
+        n, out = stack.pop()
+        for c in n["children"]:
+            child = {**project(c["annotation"]), "children": []}
+            out["children"].append(child)
+            stack.append((c, child))
+    return root
 
 
 def _view(text: str, node: dict) -> dict:
     """附带原文片段的节点视图（供页面展示）。"""
-    a = node["annotation"]
-    return {"id": a["id"], "label": a["label"],
-            "start": a["start"], "end": a["end"],
-            "text": text[a["start"]:a["end"]],
-            "children": [_view(text, c) for c in node["children"]]}
+    return _map_tree(node, lambda a: {
+        "id": a["id"], "label": a["label"],
+        "start": a["start"], "end": a["end"],
+        "text": text[a["start"]:a["end"]],
+    })
 
 
 def _export(node: dict) -> dict:
     """导出节点：保留原 id、label、范围。"""
-    a = node["annotation"]
-    return {"id": a["id"], "label": a["label"],
-            "start": a["start"], "end": a["end"],
-            "children": [_export(c) for c in node["children"]]}
+    return _map_tree(node, lambda a: {
+        "id": a["id"], "label": a["label"],
+        "start": a["start"], "end": a["end"],
+    })
 
 
 def audit_nesting(text: str, annotations: list[dict], rules: dict) -> dict:
@@ -178,3 +204,56 @@ def audit_nesting(text: str, annotations: list[dict], rules: dict) -> dict:
 def export_nesting(annotations: list[dict]) -> list[dict]:
     """导出稳定嵌套 JSON（假定审计无错误）：保留原 id、label、范围。"""
     return [_export(n) for n in build_tree(annotations)]
+
+
+def dumps_deep(obj) -> str:
+    """迭代版紧凑 JSON 序列化：嵌套任意深都不占用 C 递归栈。
+
+    标准库 json 的编码器是递归实现，默认递归上限下无法序列化上千层的
+    嵌套树；这里用显式栈展开容器。输出格式与 Starlette JSONResponse
+    一致（ensure_ascii=False、分隔符 (",", ":")），仅支持
+    dict / list / str / int / float / bool / None。
+    """
+    chunks: list[str] = []
+    # 事件栈：("value", 对象) / ("key", 对象键) / ("sep",) / ("end", 闭括号)
+    stack: list[tuple] = [("value", obj)]
+    while stack:
+        kind, *rest = stack.pop()
+        if kind == "sep":
+            chunks.append(",")
+        elif kind == "end":
+            chunks.append(rest[0])
+        elif kind == "key":
+            chunks.append(json.dumps(rest[0], ensure_ascii=False))
+            chunks.append(":")
+        else:  # "value"
+            value = rest[0]
+            if isinstance(value, dict):
+                chunks.append("{")
+                stack.append(("end", "}"))
+                first = True
+                for k, v in reversed(list(value.items())):
+                    if first:
+                        first = False
+                    else:
+                        stack.append(("sep",))
+                    stack.append(("value", v))
+                    stack.append(("key", k))
+            elif isinstance(value, (list, tuple)):
+                chunks.append("[")
+                stack.append(("end", "]"))
+                for i in range(len(value) - 1, -1, -1):
+                    if i < len(value) - 1:
+                        stack.append(("sep",))
+                    stack.append(("value", value[i]))
+            elif isinstance(value, str):
+                chunks.append(json.dumps(value, ensure_ascii=False))
+            elif value is None:
+                chunks.append("null")
+            elif value is True:
+                chunks.append("true")
+            elif value is False:
+                chunks.append("false")
+            else:  # int / float 等标量
+                chunks.append(json.dumps(value))
+    return "".join(chunks)
